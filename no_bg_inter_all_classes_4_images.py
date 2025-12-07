@@ -25,6 +25,72 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
+def create_confusion_matrix_diagram(ax):
+    """
+    Create a visual confusion matrix diagram showing TP/FP/FN/TN regions
+    """
+    import matplotlib.patches as mpatches
+
+    # Define colors - matching the TP/FP/FN overlay colors
+    colors = {
+        'TP': '#90EE90',  # Light green
+        'FP': '#FFB6C1',  # Light red/pink
+        'FN': '#ADD8E6',  # Light blue
+        'TN': '#D3D3D3',  # Light gray
+    }
+
+    # Create the 2x2 confusion matrix grid
+    cell_size = 1
+
+    # Draw cells
+    # Top-left: TP (Predicted Positive, True Class Positive)
+    tp_rect = mpatches.Rectangle((0, cell_size), cell_size, cell_size,
+                                  facecolor=colors['TP'], edgecolor='black', linewidth=2)
+    ax.add_patch(tp_rect)
+    ax.text(0.5, 1.5, 'TP', ha='center', va='center', fontsize=20, fontweight='bold')
+
+    # Top-right: FP (Predicted Positive, True Class Negative)
+    fp_rect = mpatches.Rectangle((cell_size, cell_size), cell_size, cell_size,
+                                  facecolor=colors['FP'], edgecolor='black', linewidth=2)
+    ax.add_patch(fp_rect)
+    ax.text(1.5, 1.5, 'FP', ha='center', va='center', fontsize=20, fontweight='bold')
+
+    # Bottom-left: FN (Predicted Negative, True Class Positive)
+    fn_rect = mpatches.Rectangle((0, 0), cell_size, cell_size,
+                                  facecolor=colors['FN'], edgecolor='black', linewidth=2)
+    ax.add_patch(fn_rect)
+    ax.text(0.5, 0.5, 'FN', ha='center', va='center', fontsize=20, fontweight='bold')
+
+    # Bottom-right: TN (Predicted Negative, True Class Negative)
+    tn_rect = mpatches.Rectangle((cell_size, 0), cell_size, cell_size,
+                                  facecolor=colors['TN'], edgecolor='black', linewidth=2)
+    ax.add_patch(tn_rect)
+    ax.text(1.5, 0.5, 'TN', ha='center', va='center', fontsize=20, fontweight='bold')
+
+    # Add labels
+    # True Class (vertical)
+    ax.text(-0.3, 1.5, 'Positive', rotation=90, ha='center', va='center',
+            fontsize=10, color='#FF6B6B', fontweight='bold')
+    ax.text(-0.3, 0.5, 'Negative', rotation=90, ha='center', va='center',
+            fontsize=10, color='#4ECDC4', fontweight='bold')
+    ax.text(-0.5, 1.0, 'True Class', rotation=90, ha='center', va='center',
+            fontsize=12, fontweight='bold')
+
+    # Predicted Class (horizontal)
+    ax.text(0.5, 2.3, 'Positive', ha='center', va='center',
+            fontsize=10, color='#FF6B6B', fontweight='bold')
+    ax.text(1.5, 2.3, 'Negative', ha='center', va='center',
+            fontsize=10, color='#4ECDC4', fontweight='bold')
+    ax.text(1.0, 2.55, 'Predicted Class', ha='center', va='center',
+            fontsize=12, fontweight='bold')
+
+    # Set axis properties
+    ax.set_xlim(-0.7, 2.2)
+    ax.set_ylim(-0.2, 2.8)
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+
 def show_tp_fp_fn_binary(image, gt_binary, pred_binary,
                          class_name="class", alpha=0.5, save_path=None):
     """
@@ -32,12 +98,13 @@ def show_tp_fp_fn_binary(image, gt_binary, pred_binary,
     gt_binary  : (H, W) bool/0-1 array (GT for ONE class)
     pred_binary: (H, W) bool/0-1 array (prediction for ONE class)
 
-    Creates a 4-panel figure:
-      1) Input image
-      2) GT mask for this class
-      3) Predicted mask for this class
-      4) TP/FP/FN overlay (G=TP, R=FP, B=FN)
+    Creates a comprehensive slide with:
+      - Confusion matrix diagram at top
+      - 4 image panels: Input, GT, Prediction, TP/FP/FN overlay
+      - Metrics and color legend
     """
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
 
     # ---- convert image to numpy in [0,1] for display ----
     if hasattr(image, "detach"):
@@ -55,6 +122,7 @@ def show_tp_fp_fn_binary(image, gt_binary, pred_binary,
     tp = gt & pr
     fp = (~gt) & pr
     fn = gt & (~pr)
+    tn = (~gt) & (~pr)
 
     H, W = gt.shape
     overlay = np.zeros((H, W, 3), dtype=float)
@@ -65,34 +133,96 @@ def show_tp_fp_fn_binary(image, gt_binary, pred_binary,
     blended = (1 - alpha) * img + alpha * overlay
     blended = np.clip(blended, 0, 1)
 
-    # ---- 4-panel figure ----
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    # ---- Compute metrics ----
+    tp_count = tp.sum()
+    fp_count = fp.sum()
+    fn_count = fn.sum()
+    tn_count = tn.sum()
 
-    # 1) input
-    axes[0].imshow(img)
-    axes[0].set_title("Input image")
-    axes[0].axis("off")
+    iou = tp_count / (tp_count + fp_count + fn_count) if (tp_count + fp_count + fn_count) > 0 else 0
+    precision = tp_count / (tp_count + fp_count) if (tp_count + fp_count) > 0 else 0
+    recall = tp_count / (tp_count + fn_count) if (tp_count + fn_count) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    # ---- Create figure with custom layout ----
+    fig = plt.figure(figsize=(20, 8))
+    gs = GridSpec(2, 5, figure=fig, height_ratios=[1, 2],
+                  hspace=0.3, wspace=0.3, left=0.05, right=0.95, top=0.92, bottom=0.05)
+
+    # Title
+    title_text = f'TP/FP/FN Maps'
+    if class_name:
+        title_text += f' - {class_name}'
+    fig.suptitle(title_text, fontsize=24, fontweight='bold', color='#8B0000')
+
+    # Top left: Confusion Matrix Diagram
+    ax_cm = fig.add_subplot(gs[0, 0:2])
+    create_confusion_matrix_diagram(ax_cm)
+    ax_cm.set_title('Confusion Matrix', fontsize=14, fontweight='bold', pad=10)
+
+    # Top right: Metrics
+    ax_metrics = fig.add_subplot(gs[0, 2:])
+    ax_metrics.axis('off')
+
+    metrics_text = "Performance Metrics\n" + "="*30 + "\n\n"
+    metrics_text += f"IoU:        {iou:.4f}\n"
+    metrics_text += f"F1 Score:   {f1:.4f}\n"
+    metrics_text += f"Precision:  {precision:.4f}\n"
+    metrics_text += f"Recall:     {recall:.4f}\n"
+    metrics_text += "\n" + "Pixel Counts\n" + "="*30 + "\n\n"
+    metrics_text += f"TP: {tp_count:,}\n"
+    metrics_text += f"FP: {fp_count:,}\n"
+    metrics_text += f"FN: {fn_count:,}\n"
+    metrics_text += f"TN: {tn_count:,}\n"
+
+    ax_metrics.text(0.1, 0.5, metrics_text, ha='left', va='center',
+                   fontsize=12, fontfamily='monospace',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Bottom row: Image panels
+    # 1) Input image
+    ax1 = fig.add_subplot(gs[1, 0])
+    ax1.imshow(img)
+    ax1.set_title("Input image", fontsize=14, fontweight='bold')
+    ax1.axis("off")
 
     # 2) GT mask
-    axes[1].imshow(gt, cmap="gray")
-    axes[1].set_title(f"GT: {class_name}")
-    axes[1].axis("off")
+    ax2 = fig.add_subplot(gs[1, 1])
+    ax2.imshow(gt, cmap="gray")
+    ax2.set_title(f"GT: {class_name}", fontsize=14, fontweight='bold')
+    ax2.axis("off")
 
     # 3) predicted mask
-    axes[2].imshow(pr, cmap="gray")
-    axes[2].set_title(f"Pred: {class_name}")
-    axes[2].axis("off")
+    ax3 = fig.add_subplot(gs[1, 2])
+    ax3.imshow(pr, cmap="gray")
+    ax3.set_title(f"Pred: {class_name}", fontsize=14, fontweight='bold')
+    ax3.axis("off")
 
     # 4) TP/FP/FN overlay
-    axes[3].imshow(blended)
-    axes[3].set_title(f"TP/FP/FN for {class_name}\n(G=TP, R=FP, B=FN)")
-    axes[3].axis("off")
+    ax4 = fig.add_subplot(gs[1, 3])
+    ax4.imshow(blended)
+    ax4.set_title(f"TP/FP/FN for {class_name}\n(G=TP, R=FP, B=FN)",
+                 fontsize=14, fontweight='bold')
+    ax4.axis("off")
 
-    plt.tight_layout()
+    # 5) Color legend
+    ax5 = fig.add_subplot(gs[1, 4])
+    ax5.axis('off')
+
+    # Create color legend
+    legend_elements = [
+        mpatches.Patch(color='green', label=f'TP: {tp_count:,} px'),
+        mpatches.Patch(color='red', label=f'FP: {fp_count:,} px'),
+        mpatches.Patch(color='blue', label=f'FN: {fn_count:,} px'),
+    ]
+
+    ax5.legend(handles=legend_elements, loc='center', fontsize=12,
+              frameon=True, fancybox=True, shadow=True,
+              title='Color Legend', title_fontsize=14)
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.savefig(save_path, dpi=300, bbox_inches="tight", facecolor='white')
 
     plt.close(fig)  # important on cluster to free memory
 
