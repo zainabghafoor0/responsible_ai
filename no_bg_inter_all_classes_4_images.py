@@ -100,9 +100,9 @@ def show_tp_fp_fn_binary(image, gt_binary, pred_binary,
 # ============================================================================
 # GRADCAM FOR MODEL EXPLAINABILITY
 # ============================================================================
-class GradCAM:
+class SegmentationGradCAM:
     """
-    GradCAM for semantic segmentation models.
+    Grad-CAM for semantic segmentation models.
     Shows which regions the model focuses on for each class.
     """
     def __init__(self, model, target_layer):
@@ -112,107 +112,163 @@ class GradCAM:
             target_layer: Layer to visualize (e.g., model.encoder.layer4)
         """
         self.model = model
+        self.model.eval()
         self.target_layer = target_layer
-        self.gradients = None
+
         self.activations = None
+        self.gradients = None
 
-        # Register hooks
-        self.target_layer.register_forward_hook(self.save_activation)
-        self.target_layer.register_full_backward_hook(self.save_gradient)
+        # Forward hook: save activations
+        def forward_hook(module, inp, out):
+            self.activations = out.detach()
 
-    def save_activation(self, module, input, output):
-        """Save forward pass activations"""
-        self.activations = output.detach()
+        # Backward hook: save gradients
+        def backward_hook(module, grad_in, grad_out):
+            # grad_out[0] is gradient wrt activations
+            self.gradients = grad_out[0].detach()
 
-    def save_gradient(self, module, grad_input, grad_output):
-        """Save backward pass gradients"""
-        self.gradients = grad_output[0].detach()
+        self.fwd_handle = target_layer.register_forward_hook(forward_hook)
+        self.bwd_handle = target_layer.register_full_backward_hook(backward_hook)
 
-    def generate_cam(self, input_image, target_class):
+    def __del__(self):
+        """Clean up hooks when object is destroyed"""
+        if hasattr(self, 'fwd_handle'):
+            self.fwd_handle.remove()
+        if hasattr(self, 'bwd_handle'):
+            self.bwd_handle.remove()
+
+    def generate(self, image_tensor, class_idx):
         """
-        Generate GradCAM heatmap for a specific class.
+        Generate Grad-CAM heatmap for a specific class.
 
         Args:
-            input_image: Input tensor [1, C, H, W]
-            target_class: Class index to visualize
+            image_tensor: (1, 3, H, W) torch tensor, requires_grad=False
+            class_idx: int, which class to compute Grad-CAM for
 
         Returns:
-            cam: Heatmap [H, W] normalized to [0, 1]
+            heatmap (H, W) numpy array in [0, 1]
         """
         import torch.nn.functional as F
 
-        # Forward pass
-        self.model.eval()
-        output = self.model(input_image)  # [1, num_classes, H, W]
+        self.model.zero_grad()
+        self.activations = None
+        self.gradients = None
 
-        # Get the target class output
-        target_output = output[:, target_class, :, :]
+        # Forward pass
+        logits = self.model(image_tensor)  # (1, C, H, W)
+
+        # Choose target for this class.
+        # Sum over all spatial positions (gives scalar)
+        target = logits[0, class_idx].sum()
 
         # Backward pass
-        self.model.zero_grad()
-        target_output.backward(torch.ones_like(target_output), retain_graph=True)
+        target.backward(retain_graph=True)
 
-        # Get gradients and activations
-        gradients = self.gradients  # [1, C, H', W']
-        activations = self.activations  # [1, C, H', W']
+        # activations: (1, K, H', W'), gradients: (1, K, H', W')
+        A = self.activations          # feature maps
+        G = self.gradients            # gradients
 
-        # Global average pooling of gradients
-        weights = gradients.mean(dim=(2, 3), keepdim=True)  # [1, C, 1, 1]
+        # Global average pool over spatial dims
+        # weights: (K,)
+        weights = G.mean(dim=(2, 3))[0]  # (K,)
 
-        # Weighted combination of activation maps
-        cam = (weights * activations).sum(dim=1, keepdim=True)  # [1, 1, H', W']
+        # Weighted sum over channels
+        cam = torch.zeros(A.shape[2:], dtype=torch.float32, device=A.device)  # (H', W')
+        for k, w in enumerate(weights):
+            cam += w * A[0, k, :, :]
 
-        # Apply ReLU (only positive contributions)
+        # ReLU
         cam = F.relu(cam)
 
-        # Upsample to input size
-        cam = F.interpolate(
-            cam,
-            size=input_image.shape[2:],
-            mode='bilinear',
-            align_corners=False
-        )
-
         # Normalize to [0, 1]
-        cam = cam.squeeze().cpu().numpy()
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        cam -= cam.min()
+        if cam.max() > 0:
+            cam /= cam.max()
 
-        return cam
+        # Resize to input size
+        H, W = image_tensor.shape[2], image_tensor.shape[3]
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0),
+                            size=(H, W),
+                            mode='bilinear',
+                            align_corners=False)[0, 0]
+
+        cam_np = cam.detach().cpu().numpy()
+
+        return cam_np
 
 
-def visualize_gradcam_segmentation(image, cam, class_name, alpha=0.5):
+def tensor_to_uint8(img_tensor, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
     """
-    Overlay GradCAM heatmap on image.
+    Convert normalized tensor to uint8 image.
 
     Args:
-        image: Original image [H, W, 3] in range [0, 1]
-        cam: GradCAM heatmap [H, W] in range [0, 1]
+        img_tensor: (3, H, W) tensor on CPU
+        mean: ImageNet normalization mean
+        std: ImageNet normalization std
+
+    Returns:
+        (H, W, 3) uint8 numpy array
+    """
+    img = img_tensor.clone().detach().cpu().numpy()
+    for c in range(3):
+        img[c] = img[c] * std[c] + mean[c]
+    img = np.clip(img, 0, 1)
+    img = (img * 255).astype(np.uint8)
+    img = np.transpose(img, (1, 2, 0))  # (H, W, 3)
+    return img
+
+
+def overlay_cam_on_image(img_np, cam, alpha=0.5):
+    """
+    Overlay Grad-CAM heatmap on image.
+
+    Args:
+        img_np: (H, W, 3) uint8 image
+        cam: (H, W) float in [0,1]
+        alpha: blend factor
+
+    Returns:
+        (H, W, 3) uint8 overlay
+    """
+    cam_uint8 = (cam * 255).astype(np.uint8)
+    cam_color = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
+    cam_color = cv2.cvtColor(cam_color, cv2.COLOR_BGR2RGB)
+
+    overlay = (alpha * cam_color + (1 - alpha) * img_np).astype(np.uint8)
+    return overlay
+
+
+def visualize_gradcam_segmentation(img_np, cam, class_name, alpha=0.5):
+    """
+    Create 5-panel visualization with Grad-CAM for segmentation.
+
+    Args:
+        img_np: (H, W, 3) uint8 image
+        cam: (H, W) float in [0, 1] - Grad-CAM heatmap
         class_name: Name of the class being visualized
-        alpha: Transparency of heatmap overlay
+        alpha: Transparency for overlay
 
     Returns:
         fig: Matplotlib figure
     """
-    # Convert heatmap to color using jet colormap
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+    # Create overlay using helper function
+    cam_overlay = overlay_cam_on_image(img_np, cam, alpha=alpha)
 
-    # Overlay heatmap on image
-    overlay = alpha * heatmap + (1 - alpha) * image
-    overlay = np.clip(overlay, 0, 1)
-
-    # Create visualization
+    # Create 3-panel visualization
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    axes[0].imshow(image)
+    # Panel 1: Original image
+    axes[0].imshow(img_np)
     axes[0].set_title("Original Image")
     axes[0].axis('off')
 
+    # Panel 2: Grad-CAM heatmap
     axes[1].imshow(cam, cmap='jet')
-    axes[1].set_title(f"GradCAM: {class_name}")
+    axes[1].set_title(f"Grad-CAM: {class_name}")
     axes[1].axis('off')
 
-    axes[2].imshow(overlay)
+    # Panel 3: Overlay
+    axes[2].imshow(cam_overlay)
     axes[2].set_title(f"Overlay: {class_name}")
     axes[2].axis('off')
 
@@ -220,31 +276,34 @@ def visualize_gradcam_segmentation(image, cam, class_name, alpha=0.5):
     return fig
 
 
-def gradcam_all_classes(model, image_tensor, image_orig, class_names,
+def gradcam_all_classes(model, image_tensor, class_names,
                        target_layer, save_dir="gradcam_results"):
     """
-    Generate GradCAM for all classes and save visualizations.
+    Generate Grad-CAM for all classes and save visualizations.
 
     Args:
         model: Trained segmentation model
         image_tensor: Preprocessed image tensor [1, 3, H, W]
-        image_orig: Original image [H, W, 3] in range [0, 1]
         class_names: List of class names
         target_layer: Layer to visualize
         save_dir: Directory to save results
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    gradcam = GradCAM(model, target_layer)
+    # Create Grad-CAM instance
+    gradcam = SegmentationGradCAM(model, target_layer)
+
+    # Convert tensor to uint8 for visualization
+    img_np = tensor_to_uint8(image_tensor[0].cpu())
 
     for class_idx, class_name in enumerate(class_names):
-        print(f"  Generating GradCAM for class: {class_name}")
+        print(f"  Generating Grad-CAM for class: {class_name}")
 
         # Generate CAM
-        cam = gradcam.generate_cam(image_tensor, class_idx)
+        cam = gradcam.generate(image_tensor, class_idx)
 
         # Visualize
-        fig = visualize_gradcam_segmentation(image_orig, cam, class_name)
+        fig = visualize_gradcam_segmentation(img_np, cam, class_name)
 
         # Save
         save_path = os.path.join(save_dir, f"gradcam_{class_name}.png")
@@ -252,6 +311,9 @@ def gradcam_all_classes(model, image_tensor, image_orig, class_names,
         plt.close(fig)
 
         print(f"    Saved to: {save_path}")
+
+    # Clean up (calls __del__)
+    del gradcam
 
 
 DATA_ROOT = Path("phenocyte_seg")
@@ -955,10 +1017,10 @@ if __name__ == "__main__":
         # GRADCAM EXPLAINABILITY VISUALIZATION
         # ====================================================================
         print(f"\n{'='*80}")
-        print("Generating GradCAM explainability visualizations...")
+        print("Generating Grad-CAM explainability visualizations...")
         print(f"{'='*80}")
 
-        # Get sample images from test set for GradCAM visualization
+        # Get sample images from test set for Grad-CAM visualization
         num_gradcam_samples = min(3, len(test_dataset))
 
         for sample_idx in range(num_gradcam_samples):
@@ -970,28 +1032,22 @@ if __name__ == "__main__":
             # Prepare image tensor
             image_tensor = torch.from_numpy(sample_image).unsqueeze(0).to(DEVICE)
 
-            # Unnormalize image for visualization
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
-            image_display = sample_image.transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
-            image_display = image_display * std + mean
-            image_display = np.clip(image_display, 0, 1)
-
             # Target layer: last encoder layer (highest-level semantic features)
+            # For FPN with SE-ResNeXt50 encoder
             target_layer = best_model.encoder.layer4
 
-            # Generate GradCAM for all classes
+            # Generate Grad-CAM for all classes
+            # Note: gradcam_all_classes handles unnormalization internally
             gradcam_all_classes(
                 model=best_model,
                 image_tensor=image_tensor,
-                image_orig=image_display,
                 class_names=SELECTED_CLASSES,
                 target_layer=target_layer,
                 save_dir=f"gradcam_visualizations/sample_{sample_idx}"
             )
 
         print(f"\n{'='*80}")
-        print("GradCAM visualizations saved to: gradcam_visualizations/")
+        print("Grad-CAM visualizations saved to: gradcam_visualizations/")
         print(f"{'='*80}\n")
 
     # ========================================================================
