@@ -389,9 +389,9 @@ def main():
                        help='Class index to explain (default: 2 for hypocotyl)')
     parser.add_argument('--class_name', type=str, default='hypocotyl',
                        help='Class name for visualization')
-    parser.add_argument('--method', type=str, default='gradient',
+    parser.add_argument('--method', type=str, default='deep',
                        choices=['gradient', 'deep', 'kernel'],
-                       help='SHAP method: gradient (fast), deep (medium), kernel (slow)')
+                       help='SHAP method: deep (recommended for segmentation), gradient (may fail), kernel (slow)')
     parser.add_argument('--output_dir', type=str, default='shap_explanations',
                        help='Output directory for visualizations')
     parser.add_argument('--num_samples', type=int, default=50,
@@ -424,9 +424,17 @@ def main():
 
     # Generate SHAP explanation
     if args.method == 'gradient':
-        shap_map = shap_explainer.explain_with_gradient_shap(
-            image_tensor, args.class_idx, num_background=args.num_samples
-        )
+        try:
+            shap_map = shap_explainer.explain_with_gradient_shap(
+                image_tensor, args.class_idx, num_background=args.num_samples
+            )
+        except (IndexError, RuntimeError) as e:
+            print(f"\n❌ GradientSHAP failed: {str(e)}")
+            print("🔄 Automatically switching to DeepSHAP (recommended for segmentation)...\n")
+            shap_map = shap_explainer.explain_with_deep_shap(
+                image_tensor, args.class_idx, num_background=args.num_samples
+            )
+            args.method = 'deep'  # Update method name for output file
     elif args.method == 'deep':
         shap_map = shap_explainer.explain_with_deep_shap(
             image_tensor, args.class_idx, num_background=args.num_samples
