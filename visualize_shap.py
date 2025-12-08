@@ -47,6 +47,38 @@ class SegmentationSHAP:
         self.device = device
         self.num_samples = num_samples
 
+        # Fix in-place operations for SHAP compatibility
+        self._fix_inplace_ops()
+
+    def _fix_inplace_ops(self):
+        """
+        Recursively disable in-place operations in the model.
+        This is necessary for DeepSHAP to work properly.
+        """
+        # List of activation modules that have inplace parameter
+        inplace_modules = (
+            torch.nn.ReLU,
+            torch.nn.ReLU6,
+            torch.nn.LeakyReLU,
+            torch.nn.ELU,
+            torch.nn.SELU,
+            torch.nn.CELU,
+            torch.nn.Hardswish,
+            torch.nn.SiLU,
+        )
+
+        # Use modules() to get ALL modules, not just children
+        for module in self.model.modules():
+            if isinstance(module, inplace_modules):
+                if hasattr(module, 'inplace'):
+                    module.inplace = False
+            # Also handle Dropout
+            elif isinstance(module, (torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d)):
+                if hasattr(module, 'inplace'):
+                    module.inplace = False
+
+        print("✓ Fixed in-place operations for SHAP compatibility")
+
     def preprocess_image(self, image_path, img_size=(512, 256)):
         """
         Load and preprocess image for model input
@@ -97,6 +129,9 @@ class SegmentationSHAP:
         """
         Generate SHAP explanations using GradientSHAP
 
+        Note: For segmentation models, DeepSHAP is recommended as it handles
+        spatial outputs better. GradientSHAP uses a scalar summary (sum of predictions).
+
         Args:
             image_tensor: Input image tensor (1, 3, H, W)
             class_idx: Index of class to explain
@@ -105,32 +140,36 @@ class SegmentationSHAP:
         Returns:
             shap_values: SHAP values for the image (H, W)
         """
-        print(f"Generating SHAP explanation for class {class_idx}...")
+        print(f"Generating GradientSHAP explanation for class {class_idx}...")
+        print("⚠️  Note: For segmentation, 'deep' method is recommended (--method deep)")
 
         # Create background dataset (using random noise around the input)
         background = image_tensor.clone().repeat(num_background, 1, 1, 1)
         noise = torch.randn_like(background) * 0.1
         background = background + noise
 
-        # Create explainer
+        # Create a wrapper model that outputs scalar (sum of target class)
+        class ClassOutputModel(torch.nn.Module):
+            def __init__(self, model, class_idx):
+                super().__init__()
+                self.model = model
+                self.class_idx = class_idx
+
+            def forward(self, x):
+                output = self.model(x)
+                # Return sum over spatial dimensions for the target class (scalar output)
+                return output[:, self.class_idx, :, :].sum(dim=(1, 2))
+
+        wrapped_model = ClassOutputModel(self.model, class_idx)
+
+        # Create explainer with wrapped model
         explainer = shap.GradientExplainer(
-            model=self.model,
+            model=wrapped_model,
             data=background
         )
 
-        # Compute SHAP values
-        # We need to define a wrapper that extracts the specific class output
-        def class_output(x):
-            output = self.model(x)
-            # Sum over spatial dimensions for the target class
-            return output[:, class_idx, :, :].sum(dim=(1, 2))
-
         # Get SHAP values for input
-        shap_values = explainer.shap_values(
-            image_tensor,
-            ranked_outputs=1,
-            output_rank_order="custom"
-        )
+        shap_values = explainer.shap_values(image_tensor)
 
         # Process SHAP values - average over RGB channels
         if isinstance(shap_values, list):
@@ -140,6 +179,8 @@ class SegmentationSHAP:
         shap_numpy = np.array(shap_values)
         if len(shap_numpy.shape) == 4:
             shap_map = np.abs(shap_numpy[0]).mean(axis=0)  # Average over channels
+        elif len(shap_numpy.shape) == 3:
+            shap_map = np.abs(shap_numpy).mean(axis=0)  # Average over channels
         else:
             shap_map = np.abs(shap_numpy)
 
@@ -148,6 +189,9 @@ class SegmentationSHAP:
     def explain_with_deep_shap(self, image_tensor, class_idx, num_background=10):
         """
         Generate SHAP explanations using DeepSHAP (DeepLIFT approximation)
+
+        Note: DeepSHAP is recommended over GradientSHAP for segmentation models
+        as it doesn't require scalar outputs.
 
         Args:
             image_tensor: Input image tensor (1, 3, H, W)
@@ -158,24 +202,50 @@ class SegmentationSHAP:
             shap_values: SHAP values for the image (H, W)
         """
         print(f"Generating DeepSHAP explanation for class {class_idx}...")
+        print("Note: DeepSHAP is the recommended method for segmentation models")
 
         # Create background dataset
         background = image_tensor.clone().repeat(num_background, 1, 1, 1)
         noise = torch.randn_like(background) * 0.1
         background = background + noise
 
+        # Wrapper model for class-specific output
+        class ClassSegmentationModel(torch.nn.Module):
+            def __init__(self, model, class_idx):
+                super().__init__()
+                self.model = model
+                self.class_idx = class_idx
+
+            def forward(self, x):
+                output = self.model(x)
+                # Return only target class channel, keeping spatial dimensions
+                return output[:, self.class_idx:self.class_idx+1, :, :]
+
+        wrapped_model = ClassSegmentationModel(self.model, class_idx)
+
         # Create explainer
-        explainer = shap.DeepExplainer(self.model, background)
+        explainer = shap.DeepExplainer(wrapped_model, background)
 
         # Compute SHAP values
         shap_values = explainer.shap_values(image_tensor)
 
-        # Process for specific class
-        # shap_values is a list (one per class)
+        # Process SHAP values
+        # shap_values shape: (1, 3, H, W) - SHAP values for input channels
         if isinstance(shap_values, list):
-            shap_map = np.abs(shap_values[class_idx][0]).mean(axis=0)
+            # If list, take first element
+            shap_numpy = np.array(shap_values[0])
         else:
-            shap_map = np.abs(shap_values[0, class_idx])
+            shap_numpy = np.array(shap_values)
+
+        # Average absolute SHAP values over input channels
+        if len(shap_numpy.shape) == 4:
+            # (1, 3, H, W) -> (H, W)
+            shap_map = np.abs(shap_numpy[0]).mean(axis=0)
+        elif len(shap_numpy.shape) == 3:
+            # (3, H, W) -> (H, W)
+            shap_map = np.abs(shap_numpy).mean(axis=0)
+        else:
+            shap_map = np.abs(shap_numpy)
 
         return shap_map
 
@@ -351,9 +421,9 @@ def main():
                        help='Class index to explain (default: 2 for hypocotyl)')
     parser.add_argument('--class_name', type=str, default='hypocotyl',
                        help='Class name for visualization')
-    parser.add_argument('--method', type=str, default='gradient',
+    parser.add_argument('--method', type=str, default='deep',
                        choices=['gradient', 'deep', 'kernel'],
-                       help='SHAP method: gradient (fast), deep (medium), kernel (slow)')
+                       help='SHAP method: deep (recommended for segmentation), gradient (may fail), kernel (slow)')
     parser.add_argument('--output_dir', type=str, default='shap_explanations',
                        help='Output directory for visualizations')
     parser.add_argument('--num_samples', type=int, default=50,
@@ -386,9 +456,17 @@ def main():
 
     # Generate SHAP explanation
     if args.method == 'gradient':
-        shap_map = shap_explainer.explain_with_gradient_shap(
-            image_tensor, args.class_idx, num_background=args.num_samples
-        )
+        try:
+            shap_map = shap_explainer.explain_with_gradient_shap(
+                image_tensor, args.class_idx, num_background=args.num_samples
+            )
+        except (IndexError, RuntimeError) as e:
+            print(f"\n❌ GradientSHAP failed: {str(e)}")
+            print("🔄 Automatically switching to DeepSHAP (recommended for segmentation)...\n")
+            shap_map = shap_explainer.explain_with_deep_shap(
+                image_tensor, args.class_idx, num_background=args.num_samples
+            )
+            args.method = 'deep'  # Update method name for output file
     elif args.method == 'deep':
         shap_map = shap_explainer.explain_with_deep_shap(
             image_tensor, args.class_idx, num_background=args.num_samples

@@ -168,18 +168,22 @@ class SegmentationLIME:
 
         return explanation, segments
 
-    def get_importance_map(self, explanation, segments, label=1):
+    def get_importance_map(self, explanation, segments, label=None):
         """
         Convert LIME explanation to pixel-level importance map
 
         Args:
             explanation: LIME explanation object
             segments: Superpixel segmentation
-            label: Label to explain (1 = positive class)
+            label: Label to explain (None = use top label)
 
         Returns:
             importance_map: Pixel-level importance (H, W)
         """
+        # Get the label to explain (use top label if not specified)
+        if label is None:
+            label = explanation.top_labels[0]
+
         # Get the local explanation
         local_exp = explanation.local_exp[label]
 
@@ -371,8 +375,8 @@ def main():
         n_segments=args.n_segments
     )
 
-    # Get importance map
-    importance_map = lime_explainer.get_importance_map(explanation, segments, label=1)
+    # Get importance map (uses top label automatically)
+    importance_map = lime_explainer.get_importance_map(explanation, segments)
 
     # Create visualization
     output_path = os.path.join(args.output_dir,
