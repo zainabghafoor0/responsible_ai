@@ -47,6 +47,22 @@ class SegmentationSHAP:
         self.device = device
         self.num_samples = num_samples
 
+        # Fix in-place operations for SHAP compatibility
+        self._fix_inplace_ops()
+
+    def _fix_inplace_ops(self):
+        """
+        Recursively disable in-place operations in the model.
+        This is necessary for DeepSHAP to work properly.
+        """
+        def disable_inplace(module):
+            for child in module.children():
+                if isinstance(child, torch.nn.ReLU):
+                    child.inplace = False
+                disable_inplace(child)
+
+        disable_inplace(self.model)
+
     def preprocess_image(self, image_path, img_size=(512, 256)):
         """
         Load and preprocess image for model input
