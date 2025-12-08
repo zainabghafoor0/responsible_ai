@@ -97,6 +97,9 @@ class SegmentationSHAP:
         """
         Generate SHAP explanations using GradientSHAP
 
+        Note: For segmentation models, DeepSHAP is recommended as it handles
+        spatial outputs better. GradientSHAP uses a scalar summary (sum of predictions).
+
         Args:
             image_tensor: Input image tensor (1, 3, H, W)
             class_idx: Index of class to explain
@@ -105,14 +108,15 @@ class SegmentationSHAP:
         Returns:
             shap_values: SHAP values for the image (H, W)
         """
-        print(f"Generating SHAP explanation for class {class_idx}...")
+        print(f"Generating GradientSHAP explanation for class {class_idx}...")
+        print("⚠️  Note: For segmentation, 'deep' method is recommended (--method deep)")
 
         # Create background dataset (using random noise around the input)
         background = image_tensor.clone().repeat(num_background, 1, 1, 1)
         noise = torch.randn_like(background) * 0.1
         background = background + noise
 
-        # Create a wrapper model that outputs only the target class
+        # Create a wrapper model that outputs scalar (sum of target class)
         class ClassOutputModel(torch.nn.Module):
             def __init__(self, model, class_idx):
                 super().__init__()
@@ -121,8 +125,8 @@ class SegmentationSHAP:
 
             def forward(self, x):
                 output = self.model(x)
-                # Return only the target class channel
-                return output[:, self.class_idx:self.class_idx+1, :, :]
+                # Return sum over spatial dimensions for the target class (scalar output)
+                return output[:, self.class_idx, :, :].sum(dim=(1, 2))
 
         wrapped_model = ClassOutputModel(self.model, class_idx)
 
@@ -154,6 +158,9 @@ class SegmentationSHAP:
         """
         Generate SHAP explanations using DeepSHAP (DeepLIFT approximation)
 
+        Note: DeepSHAP is recommended over GradientSHAP for segmentation models
+        as it doesn't require scalar outputs.
+
         Args:
             image_tensor: Input image tensor (1, 3, H, W)
             class_idx: Index of class to explain
@@ -163,24 +170,50 @@ class SegmentationSHAP:
             shap_values: SHAP values for the image (H, W)
         """
         print(f"Generating DeepSHAP explanation for class {class_idx}...")
+        print("Note: DeepSHAP is the recommended method for segmentation models")
 
         # Create background dataset
         background = image_tensor.clone().repeat(num_background, 1, 1, 1)
         noise = torch.randn_like(background) * 0.1
         background = background + noise
 
+        # Wrapper model for class-specific output
+        class ClassSegmentationModel(torch.nn.Module):
+            def __init__(self, model, class_idx):
+                super().__init__()
+                self.model = model
+                self.class_idx = class_idx
+
+            def forward(self, x):
+                output = self.model(x)
+                # Return only target class channel, keeping spatial dimensions
+                return output[:, self.class_idx:self.class_idx+1, :, :]
+
+        wrapped_model = ClassSegmentationModel(self.model, class_idx)
+
         # Create explainer
-        explainer = shap.DeepExplainer(self.model, background)
+        explainer = shap.DeepExplainer(wrapped_model, background)
 
         # Compute SHAP values
         shap_values = explainer.shap_values(image_tensor)
 
-        # Process for specific class
-        # shap_values is a list (one per class)
+        # Process SHAP values
+        # shap_values shape: (1, 3, H, W) - SHAP values for input channels
         if isinstance(shap_values, list):
-            shap_map = np.abs(shap_values[class_idx][0]).mean(axis=0)
+            # If list, take first element
+            shap_numpy = np.array(shap_values[0])
         else:
-            shap_map = np.abs(shap_values[0, class_idx])
+            shap_numpy = np.array(shap_values)
+
+        # Average absolute SHAP values over input channels
+        if len(shap_numpy.shape) == 4:
+            # (1, 3, H, W) -> (H, W)
+            shap_map = np.abs(shap_numpy[0]).mean(axis=0)
+        elif len(shap_numpy.shape) == 3:
+            # (3, H, W) -> (H, W)
+            shap_map = np.abs(shap_numpy).mean(axis=0)
+        else:
+            shap_map = np.abs(shap_numpy)
 
         return shap_map
 
