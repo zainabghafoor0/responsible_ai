@@ -55,13 +55,29 @@ class SegmentationSHAP:
         Recursively disable in-place operations in the model.
         This is necessary for DeepSHAP to work properly.
         """
-        def disable_inplace(module):
-            for child in module.children():
-                if isinstance(child, torch.nn.ReLU):
-                    child.inplace = False
-                disable_inplace(child)
+        # List of activation modules that have inplace parameter
+        inplace_modules = (
+            torch.nn.ReLU,
+            torch.nn.ReLU6,
+            torch.nn.LeakyReLU,
+            torch.nn.ELU,
+            torch.nn.SELU,
+            torch.nn.CELU,
+            torch.nn.Hardswish,
+            torch.nn.SiLU,
+        )
 
-        disable_inplace(self.model)
+        # Use modules() to get ALL modules, not just children
+        for module in self.model.modules():
+            if isinstance(module, inplace_modules):
+                if hasattr(module, 'inplace'):
+                    module.inplace = False
+            # Also handle Dropout
+            elif isinstance(module, (torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d)):
+                if hasattr(module, 'inplace'):
+                    module.inplace = False
+
+        print("✓ Fixed in-place operations for SHAP compatibility")
 
     def preprocess_image(self, image_path, img_size=(512, 256)):
         """
