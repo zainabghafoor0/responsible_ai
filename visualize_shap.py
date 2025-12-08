@@ -112,25 +112,28 @@ class SegmentationSHAP:
         noise = torch.randn_like(background) * 0.1
         background = background + noise
 
-        # Create explainer
+        # Create a wrapper model that outputs only the target class
+        class ClassOutputModel(torch.nn.Module):
+            def __init__(self, model, class_idx):
+                super().__init__()
+                self.model = model
+                self.class_idx = class_idx
+
+            def forward(self, x):
+                output = self.model(x)
+                # Return only the target class channel
+                return output[:, self.class_idx:self.class_idx+1, :, :]
+
+        wrapped_model = ClassOutputModel(self.model, class_idx)
+
+        # Create explainer with wrapped model
         explainer = shap.GradientExplainer(
-            model=self.model,
+            model=wrapped_model,
             data=background
         )
 
-        # Compute SHAP values
-        # We need to define a wrapper that extracts the specific class output
-        def class_output(x):
-            output = self.model(x)
-            # Sum over spatial dimensions for the target class
-            return output[:, class_idx, :, :].sum(dim=(1, 2))
-
         # Get SHAP values for input
-        shap_values = explainer.shap_values(
-            image_tensor,
-            ranked_outputs=1,
-            output_rank_order="custom"
-        )
+        shap_values = explainer.shap_values(image_tensor)
 
         # Process SHAP values - average over RGB channels
         if isinstance(shap_values, list):
@@ -140,6 +143,8 @@ class SegmentationSHAP:
         shap_numpy = np.array(shap_values)
         if len(shap_numpy.shape) == 4:
             shap_map = np.abs(shap_numpy[0]).mean(axis=0)  # Average over channels
+        elif len(shap_numpy.shape) == 3:
+            shap_map = np.abs(shap_numpy).mean(axis=0)  # Average over channels
         else:
             shap_map = np.abs(shap_numpy)
 
